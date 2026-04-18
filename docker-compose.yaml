@@ -1,0 +1,13 @@
+services:
+  ygg-manager:
+    image: ghcr.io/Split174/ygg-manager:latest
+    container_name: ygg-manager
+    restart: unless-stopped
+    volumes:
+      - /var/run/yggdrasil/yggdrasil.sock:/var/run/yggdrasil/yggdrasil.sock:z
+    environment:
+      # You can tweak the settings below
+      - MAX_PEERS=3
+      - MAX_LATENCY_MS=150
+      - MAX_COST=250.0
+      - PEER_COUNTRY=        # Leave empty for worldwide, or set to e.g., 'netherlands', 'russia', 'japan'

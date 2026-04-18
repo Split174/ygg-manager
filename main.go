@@ -13,22 +13,30 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	DefaultEndpoint   = "unix:///var/run/yggdrasil/yggdrasil.sock"
-	PeersJSONURL      = "https://raw.githubusercontent.com/Yggdrasil-Unofficial/pubpeers/refs/heads/master/peers.json"
-	MaxPeers          = 3
-	PingTimeout       = 3 * time.Second
-	CheckInterval     = 2 * time.Minute
-	DefaultMaxLatency = 300
-	BatchSize         = 20
+	DefaultEndpoint = "unix:///var/run/yggdrasil/yggdrasil.sock"
+	PeersJSONURL    = "https://raw.githubusercontent.com/Yggdrasil-Unofficial/pubpeers/refs/heads/master/peers.json"
+	PingTimeout     = 3 * time.Second
+	BatchSize       = 20
+	TopNEntropy     = 7
+
+	CheckInterval      = 30 * time.Second
+	MaxStrikes         = 5
+	MaxConcurrentPings = 5
+	SlowStartDelay     = 2 * time.Second
 )
 
 var (
+	maxPeers      int
 	maxLatency    time.Duration
+	maxCost       float64
 	targetCountry string
+
+	peerStrikes = make(map[string]int)
 )
 
 type YggRequest struct {
@@ -42,32 +50,70 @@ type PeerStat struct {
 	Latency time.Duration
 }
 
+type ActivePeer struct {
+	URI  string
+	Cost float64
+	IsUp bool
+}
+
 func main() {
-	log.Println("Yggdrasil Smart Peer Manager запущен...")
+	log.Println("Yggdrasil Smart Peer Manager started...")
 
 	endpoint := os.Getenv("YGG_ENDPOINT")
 	if endpoint == "" {
 		endpoint = DefaultEndpoint
 	}
 
-	maxLatency = time.Duration(DefaultMaxLatency) * time.Millisecond
+	maxPeers = 3
+	if val := os.Getenv("MAX_PEERS"); val != "" {
+		if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
+			if parsed > 4 {
+				log.Printf("[WARNING] MAX_PEERS = %d specified. Limit exceeded! Forcing to: 4", parsed)
+				maxPeers = 4
+			} else {
+				maxPeers = parsed
+			}
+		}
+	}
+
+	latencyMs := 150
 	if val := os.Getenv("MAX_LATENCY_MS"); val != "" {
 		if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
-			maxLatency = time.Duration(parsed) * time.Millisecond
+			if parsed < 100 {
+				log.Printf("[WARNING] MAX_LATENCY_MS = %d specified. Too aggressive ping! Forcing to: 100", parsed)
+				latencyMs = 100
+			} else {
+				latencyMs = parsed
+			}
+		}
+	}
+	maxLatency = time.Duration(latencyMs) * time.Millisecond
+
+	maxCost = 250.0
+	if val := os.Getenv("MAX_COST"); val != "" {
+		if parsed, err := strconv.ParseFloat(val, 64); err == nil {
+			if parsed < 150.0 {
+				log.Printf("[WARNING] MAX_COST = %.1f specified. Too low cost! Forcing to: 150.0", parsed)
+				maxCost = 150.0
+			} else {
+				maxCost = parsed
+			}
 		}
 	}
 
 	targetCountry = strings.ToLower(strings.TrimSpace(os.Getenv("PEER_COUNTRY")))
 
 	log.Printf("Endpoint: %s", endpoint)
+	log.Printf("Max Peers: %d", maxPeers)
 	log.Printf("Max Ping: %v", maxLatency)
-	log.Printf("Country : %s (если пусто - весь мир)", targetCountry)
+	log.Printf("Max Cost: %.1f", maxCost)
+	log.Printf("Country : %s (if empty - worldwide)", targetCountry)
 
 	rand.Seed(time.Now().UnixNano())
 
 	for {
 		managePeers(endpoint)
-		log.Printf("Спим %v...\n\n", CheckInterval)
+		log.Printf("Sleeping for %v...\n\n", CheckInterval)
 		time.Sleep(CheckInterval)
 	}
 }
@@ -75,46 +121,79 @@ func main() {
 func managePeers(endpoint string) {
 	currentPeers, err := getCurrentPeers(endpoint)
 	if err != nil {
-		log.Printf("Ошибка получения текущих пиров: %v", err)
+		log.Printf("Error getting current peers: %v", err)
 		return
 	}
 
 	activeCount := len(currentPeers)
-	log.Printf("Текущих активных исходящих пиров: %d / %d", activeCount, MaxPeers)
+	log.Printf("Current outbound peers in Yggdrasil (incl. Down): %d / %d", activeCount, maxPeers)
 
 	connectedHosts := make(map[string]bool)
+	activeHostsThisRun := make(map[string]bool)
 
-	for _, uri := range currentPeers {
-		host := extractHost(uri)
-		latency := checkLatency(uri)
+	for _, peer := range currentPeers {
+		host := extractHost(peer.URI)
+		latency := checkLatency(peer.URI)
+		activeHostsThisRun[host] = true
 
-		if latency == 0 || latency > maxLatency {
-			log.Printf("[-] Пир %s умер или медленный (%v > %v). Удаляем...", host, latency, maxLatency)
-			removePeer(endpoint, uri)
-			activeCount--
+		if !peer.IsUp || latency == 0 || latency > maxLatency || peer.Cost > maxCost {
+			var reason string
+			if !peer.IsUp {
+				reason = "dropped inside Yggdrasil (Down/i-o timeout)"
+			} else if latency == 0 {
+				reason = "physically dead (TCP ping 0)"
+			} else if latency > maxLatency {
+				reason = fmt.Sprintf("too slow (%v > %v)", latency, maxLatency)
+			} else {
+				reason = fmt.Sprintf("cost too high (%.0f > %.0f)", peer.Cost, maxCost)
+			}
+
+			peerStrikes[host]++
+			log.Printf("[~] WARNING: Peer %s %s. Strike given: %d/%d", host, reason, peerStrikes[host], MaxStrikes)
+
+			if peerStrikes[host] >= MaxStrikes {
+				log.Printf("[-] Peer %s exceeded strike limit. Removing permanently...", host)
+				removePeer(endpoint, peer.URI)
+				activeCount--
+				delete(peerStrikes, host)
+			} else {
+				connectedHosts[host] = true
+			}
 		} else {
-			log.Printf("[OK] Текущий пир %s жив. Пинг: %v", host, latency)
+			peerStrikes[host] = 0
+			log.Printf("[OK] Current peer %s is stable. Ping: %v | Cost: %.0f", host, latency, peer.Cost)
 			connectedHosts[host] = true
 		}
 	}
 
-	if activeCount >= MaxPeers {
-		log.Println("Количество пиров в норме.")
+	for host := range peerStrikes {
+		if !activeHostsThisRun[host] {
+			delete(peerStrikes, host)
+		}
+	}
+
+	if activeCount >= maxPeers {
+		log.Println("Peer count is normal. No search required.")
 		return
 	}
 
-	log.Printf("Не хватает %d пиров. Ищем новые...", MaxPeers-activeCount)
+	log.Printf("Slots freed: %d. Searching for new ones...", maxPeers-activeCount)
 
 	countryPeers, globalPeers, err := fetchAndSplitPeers(PeersJSONURL, targetCountry)
 	if err != nil {
-		log.Printf("Ошибка получения списка: %v", err)
+		log.Printf("Error fetching node list: %v", err)
 		return
 	}
 
 	testBatch := buildTestBatch(countryPeers, globalPeers, BatchSize)
-	var scoredPeers []PeerStat
 
-	log.Printf("Выбрано %d нод для пинга...", len(testBatch))
+	var scoredPeers []PeerStat
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	sem := make(chan struct{}, MaxConcurrentPings)
+
+	log.Printf("Pinging %d new nodes concurrently (up to %d threads)...", len(testBatch), MaxConcurrentPings)
 
 	for _, uri := range testBatch {
 		host := extractHost(uri)
@@ -122,32 +201,60 @@ func managePeers(endpoint string) {
 			continue
 		}
 
-		lat := checkLatency(uri)
-		if lat > 0 {
-			scoredPeers = append(scoredPeers, PeerStat{URI: uri, Host: host, Latency: lat})
-		}
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(nodeUri, nodeHost string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			lat := checkLatency(nodeUri)
+			if lat > 0 && lat <= maxLatency {
+				mu.Lock()
+				scoredPeers = append(scoredPeers, PeerStat{URI: nodeUri, Host: nodeHost, Latency: lat})
+				mu.Unlock()
+			}
+		}(uri, host)
+	}
+
+	wg.Wait()
+
+	if len(scoredPeers) == 0 {
+		log.Println("No new peers passed the preliminary TCP check.")
+		return
 	}
 
 	sort.Slice(scoredPeers, func(i, j int) bool {
 		return scoredPeers[i].Latency < scoredPeers[j].Latency
 	})
 
+	if len(scoredPeers) > TopNEntropy {
+		scoredPeers = scoredPeers[:TopNEntropy]
+	}
+
+	rand.Shuffle(len(scoredPeers), func(i, j int) {
+		scoredPeers[i], scoredPeers[j] = scoredPeers[j], scoredPeers[i]
+	})
+
 	for _, p := range scoredPeers {
-		if activeCount >= MaxPeers {
+		if activeCount >= maxPeers {
 			break
 		}
 		if connectedHosts[p.Host] {
 			continue
 		}
-		if p.Latency > maxLatency {
-			continue
-		}
 
-		log.Printf("[+] Добавляем пира: %s (Пинг: %v)", p.URI, p.Latency)
+		log.Printf("[+] Connecting peer: %s (Expected ping: %v)", p.URI, p.Latency)
 		err := addPeer(endpoint, p.URI)
 		if err == nil {
 			activeCount++
 			connectedHosts[p.Host] = true
+			peerStrikes[p.Host] = 0
+
+			if activeCount < maxPeers {
+				log.Printf("⏳ Giving Yggdrasil %v to stabilize the connection...", SlowStartDelay)
+				time.Sleep(SlowStartDelay)
+			}
 		}
 	}
 }
@@ -176,13 +283,13 @@ func callYggAPI(endpoint string, req YggRequest) (map[string]interface{}, error)
 	return response, nil
 }
 
-func getCurrentPeers(endpoint string) ([]string, error) {
+func getCurrentPeers(endpoint string) ([]ActivePeer, error) {
 	resp, err := callYggAPI(endpoint, YggRequest{Request: "getPeers"})
 	if err != nil {
 		return nil, err
 	}
 
-	var activeURIs []string
+	var activePeers []ActivePeer
 	var peersList []interface{}
 
 	if responseObj, ok := resp["response"].(map[string]interface{}); ok {
@@ -194,7 +301,7 @@ func getCurrentPeers(endpoint string) ([]string, error) {
 	}
 
 	if peersList == nil {
-		return activeURIs, nil
+		return activePeers, nil
 	}
 
 	for _, p := range peersList {
@@ -205,8 +312,10 @@ func getCurrentPeers(endpoint string) ([]string, error) {
 		if inbound, ok := peerData["inbound"].(bool); ok && inbound {
 			continue
 		}
-		if up, ok := peerData["up"].(bool); ok && !up {
-			continue
+
+		isUp := false
+		if upStatus, ok := peerData["up"].(bool); ok {
+			isUp = upStatus
 		}
 
 		uri := ""
@@ -216,11 +325,22 @@ func getCurrentPeers(endpoint string) ([]string, error) {
 			uri = ep
 		}
 
+		cost := 0.0
+		if c, ok := peerData["cost"].(float64); ok {
+			cost = c
+		} else if cInt, ok := peerData["cost"].(int); ok {
+			cost = float64(cInt)
+		}
+
 		if uri != "" {
-			activeURIs = append(activeURIs, uri)
+			activePeers = append(activePeers, ActivePeer{
+				URI:  uri,
+				Cost: cost,
+				IsUp: isUp,
+			})
 		}
 	}
-	return activeURIs, nil
+	return activePeers, nil
 }
 
 func addPeer(endpoint, uri string) error {
@@ -246,7 +366,17 @@ func removePeer(endpoint, uri string) error {
 }
 
 func fetchAndSplitPeers(jsonURL, target string) ([]string, []string, error) {
-	resp, err := http.Get(jsonURL)
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	req, err := http.NewRequest("GET", jsonURL, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("User-Agent", "Yggdrasil-Smart-Peer-Manager/1.1 (https://github.com/your-username/yggdrasil-manager)")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -334,8 +464,13 @@ func checkLatency(uriStr string) time.Duration {
 		return 0
 	}
 
+	network := "tcp"
+	if u.Scheme == "quic" {
+		network = "udp"
+	}
+
 	start := time.Now()
-	conn, err := net.DialTimeout("tcp", u.Host, PingTimeout)
+	conn, err := net.DialTimeout(network, u.Host, PingTimeout)
 	if err != nil {
 		return 0
 	}
