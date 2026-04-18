@@ -15,14 +15,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/spf13/pflag"
 )
 
 const (
-	DefaultEndpoint = "unix:///var/run/yggdrasil/yggdrasil.sock"
-	PeersJSONURL    = "https://raw.githubusercontent.com/Yggdrasil-Unofficial/pubpeers/refs/heads/master/peers.json"
-	PingTimeout     = 3 * time.Second
-	BatchSize       = 20
-	TopNEntropy     = 7
+	PeersJSONURL = "https://raw.githubusercontent.com/Yggdrasil-Unofficial/pubpeers/refs/heads/master/peers.json"
+	PingTimeout  = 3 * time.Second
+	BatchSize    = 20
+	TopNEntropy  = 7
 
 	CheckInterval      = 30 * time.Second
 	MaxStrikes         = 5
@@ -57,52 +58,87 @@ type ActivePeer struct {
 }
 
 func main() {
-	log.Println("Yggdrasil Smart Peer Manager started...")
-
-	endpoint := os.Getenv("YGG_ENDPOINT")
-	if endpoint == "" {
-		endpoint = DefaultEndpoint
+	defEndpoint := findDefaultEndpoint()
+	if envEndpoint := os.Getenv("YGG_ENDPOINT"); envEndpoint != "" {
+		defEndpoint = envEndpoint
 	}
 
-	maxPeers = 3
+	defMaxPeers := 3
 	if val := os.Getenv("MAX_PEERS"); val != "" {
 		if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
-			if parsed > 4 {
-				log.Printf("[WARNING] MAX_PEERS = %d specified. Limit exceeded! Forcing to: 4", parsed)
-				maxPeers = 4
-			} else {
-				maxPeers = parsed
-			}
+			defMaxPeers = parsed
 		}
 	}
 
-	latencyMs := 150
+	defLatencyMs := 150
 	if val := os.Getenv("MAX_LATENCY_MS"); val != "" {
 		if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
-			if parsed < 100 {
-				log.Printf("[WARNING] MAX_LATENCY_MS = %d specified. Too aggressive ping! Forcing to: 100", parsed)
-				latencyMs = 100
-			} else {
-				latencyMs = parsed
-			}
+			defLatencyMs = parsed
 		}
 	}
-	maxLatency = time.Duration(latencyMs) * time.Millisecond
 
-	maxCost = 250.0
+	defMaxCost := 250.0
 	if val := os.Getenv("MAX_COST"); val != "" {
 		if parsed, err := strconv.ParseFloat(val, 64); err == nil {
-			if parsed < 150.0 {
-				log.Printf("[WARNING] MAX_COST = %.1f specified. Too low cost! Forcing to: 150.0", parsed)
-				maxCost = 150.0
-			} else {
-				maxCost = parsed
-			}
+			defMaxCost = parsed
 		}
 	}
 
-	targetCountry = strings.ToLower(strings.TrimSpace(os.Getenv("PEER_COUNTRY")))
+	defCountry := os.Getenv("PEER_COUNTRY")
 
+	var (
+		argEndpoint string
+		argMaxPeers int
+		argLatency  int
+		argMaxCost  float64
+		argCountry  string
+		showHelp    bool
+	)
+
+	pflag.StringVarP(&argEndpoint, "endpoint", "e", defEndpoint, "Yggdrasil API endpoint (env: YGG_ENDPOINT)")
+	pflag.IntVarP(&argMaxPeers, "max-peers", "p", defMaxPeers, "Maximum number of peers (env: MAX_PEERS)")
+	pflag.IntVarP(&argLatency, "max-latency", "l", defLatencyMs, "Maximum latency in ms (env: MAX_LATENCY_MS)")
+	pflag.Float64VarP(&argMaxCost, "max-cost", "c", defMaxCost, "Maximum cost of peer (env: MAX_COST)")
+	pflag.StringVar(&argCountry, "country", defCountry, "Target country/region for peers e.g., 'netherlands' (env: PEER_COUNTRY)")
+	pflag.BoolVarP(&showHelp, "help", "h", false, "Show this help message")
+
+	pflag.Parse()
+
+	if showHelp {
+		fmt.Println("Yggdrasil Smart Peer Manager")
+		fmt.Println("Usage:")
+		pflag.PrintDefaults()
+		os.Exit(0)
+	}
+
+	endpoint := argEndpoint
+
+	if argMaxPeers > 4 {
+		log.Printf("[WARNING] max-peers = %d specified. Limit exceeded! Forcing to: 4", argMaxPeers)
+		maxPeers = 4
+	} else if argMaxPeers <= 0 {
+		maxPeers = 3
+	} else {
+		maxPeers = argMaxPeers
+	}
+
+	if argLatency < 100 {
+		log.Printf("[WARNING] max-latency = %d specified. Too aggressive ping! Forcing to: 100", argLatency)
+		maxLatency = 100 * time.Millisecond
+	} else {
+		maxLatency = time.Duration(argLatency) * time.Millisecond
+	}
+
+	if argMaxCost < 150.0 {
+		log.Printf("[WARNING] max-cost = %.1f specified. Too low cost! Forcing to: 150.0", argMaxCost)
+		maxCost = 150.0
+	} else {
+		maxCost = argMaxCost
+	}
+
+	targetCountry = strings.ToLower(strings.TrimSpace(argCountry))
+
+	log.Println("Yggdrasil Smart Peer Manager started...")
 	log.Printf("Endpoint: %s", endpoint)
 	log.Printf("Max Peers: %d", maxPeers)
 	log.Printf("Max Ping: %v", maxLatency)
@@ -116,6 +152,23 @@ func main() {
 		log.Printf("Sleeping for %v...\n\n", CheckInterval)
 		time.Sleep(CheckInterval)
 	}
+}
+
+func findDefaultEndpoint() string {
+	candidatePaths := []string{
+		"/var/run/yggdrasil.sock",
+		"/var/run/yggdrasil/yggdrasil.sock",
+		"/run/yggdrasil.sock",
+		"/run/yggdrasil/yggdrasil.sock",
+	}
+
+	for _, path := range candidatePaths {
+		if _, err := os.Stat(path); err == nil {
+			return "unix://" + path
+		}
+	}
+
+	return "unix:///var/run/yggdrasil.sock"
 }
 
 func managePeers(endpoint string) {

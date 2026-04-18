@@ -2,6 +2,9 @@
 
 A lightweight, automated peer manager for the [Yggdrasil Network](https://yggdrasil-network.github.io/). It continuously monitors your active outbound peers, tests their latency and routing cost, removes underperforming peers, and automatically discovers and connects to new, optimal peers from a public registry.
 
+> ⚠️ **IMPORTANT PREREQUISITE**
+> This tool does not replace the Yggdrasil node itself. **The Yggdrasil Network daemon must be installed and actively running** on your machine for this manager to work. The manager communicates with Yggdrasil via its Admin API socket, which must be accessible.
+
 ## ✨ Features
 
 - **Automated Peer Management**: Frees you from manually searching and adding peers.
@@ -15,15 +18,18 @@ A lightweight, automated peer manager for the [Yggdrasil Network](https://yggdra
 
 ## ⚙️ Configuration
 
-All configuration is done via environment variables.
+Configuration can be done via **Command-Line Flags** or **Environment Variables**. If both are provided, flags will take precedence.
 
-| Variable | Description | Default | Limits |
-| :--- | :--- | :--- | :--- |
-| `YGG_ENDPOINT` | Yggdrasil admin socket endpoint | `unix:///var/run/yggdrasil/yggdrasil.sock` | - |
-| `MAX_PEERS` | Maximum number of outbound peers | `3` | Max `4` |
-| `MAX_LATENCY_MS` | Maximum acceptable ping (ms) | `150` | Min `100` |
-| `MAX_COST` | Maximum acceptable Yggdrasil routing cost | `250.0` | Min `150.0` |
-| `PEER_COUNTRY` | Preferred country from this [json](https://raw.githubusercontent.com/Yggdrasil-Unofficial/pubpeers/refs/heads/master/peers.json) | `""` (Worldwide) | - |
+| Flag | Env Variable | Description | Default | Limits |
+| :--- | :--- | :--- | :--- | :--- |
+| `-e`, `--endpoint` | `YGG_ENDPOINT` | Yggdrasil admin socket endpoint | *Auto-detected* *\** | - |
+| `-p`, `--max-peers` | `MAX_PEERS` | Maximum number of outbound peers | `3` | Max `4` |
+| `-l`, `--max-latency`| `MAX_LATENCY_MS` | Maximum acceptable ping (ms) | `150` | Min `100` |
+| `-c`, `--max-cost` | `MAX_COST` | Maximum acceptable Yggdrasil routing cost | `250.0` | Min `150.0` |
+| `--country` | `PEER_COUNTRY` | Preferred country from this [json](https://raw.githubusercontent.com/Yggdrasil-Unofficial/pubpeers/refs/heads/master/peers.json) | `""` (Worldwide) | - |
+| `-h`, `--help` | - | Show help message | - | - |
+
+*\* By default, the manager automatically scans common paths for the Yggdrasil socket (e.g., `/var/run/yggdrasil.sock`, `/run/yggdrasil/yggdrasil.sock`). If not found, it defaults to `unix:///var/run/yggdrasil.sock`.*
 
 ## 🚀 Installation & Running
 
@@ -33,13 +39,19 @@ Download the latest binary for your architecture from the [Releases](../../relea
 
 ```bash
 # Example for amd64
-wget https://github.com/Split174/ygg-manager/releases/latest/download/yggmgr-linux-amd64
+wget https://github.com/split174/ygg-manager/releases/latest/download/yggmgr-linux-amd64
 chmod +x yggmgr-linux-amd64
+
+# Show help and all available options
+./yggmgr-linux-amd64 --help
 
 # Run with default settings
 ./yggmgr-linux-amd64
 
-# Run with custom settings
+# Run with custom settings via flags
+./yggmgr-linux-amd64 --max-peers 4 --country netherlands
+
+# Run with custom settings via env vars
 MAX_PEERS=4 PEER_COUNTRY=netherlands ./yggmgr-linux-amd64
 ```
 
@@ -53,7 +65,7 @@ The image is built for `linux/amd64` and `linux/arm64` and published to the GitH
    ```yaml
    services:
      ygg-manager:
-       image: ghcr.io/Split174/ygg-manager:latest
+       image: ghcr.io/split174/ygg-manager:latest
        container_name: ygg-manager
        restart: unless-stopped
        volumes:
@@ -86,12 +98,12 @@ docker run -d \
   -e MAX_LATENCY_MS=150 \
   -e MAX_COST=250.0 \
   -e PEER_COUNTRY="" \
-  ghcr.io/Split174/ygg-manager:latest
+  ghcr.io/split174/ygg-manager:latest
 ```
 
 ### 3. Via Systemd
 
-If you are running Yggdrasil on a Linux host, running the manager as a systemd service is the recommended approach.
+If you are running Yggdrasil on a Linux host, running the manager as a systemd service is the recommended approach. *You can use Command-Line flags inside the `ExecStart` line.*
 
 1. Download the binary and move it to `/usr/local/bin/`:
    ```bash
@@ -108,11 +120,7 @@ If you are running Yggdrasil on a Linux host, running the manager as a systemd s
 
    [Service]
    Type=simple
-   ExecStart=/usr/local/bin/ygg-manager
-   Environment=MAX_PEERS=3
-   Environment=MAX_LATENCY_MS=150
-   Environment=MAX_COST=250
-   Environment=PEER_COUNTRY=""
+   ExecStart=/usr/local/bin/ygg-manager --max-peers 3 --max-latency 150 --max-cost 250 --country ""
    Restart=on-failure
    RestartSec=10
 
